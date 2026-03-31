@@ -1,0 +1,40 @@
+# Example config for termux-codex-keeper
+# Copy this file to:
+#   $HOME/.config/termux-codex-keeper/config.conf
+# Or point TERMUX_CODEX_KEEPER_CONFIG at a custom path.
+
+APP_NAME="Codex app-server"
+
+# Supported values: url, command
+HEALTHCHECK_MODE="url"
+
+# URL mode
+HEALTHCHECK_URL="http://127.0.0.1:3000/health"
+HEALTHCHECK_METHOD="GET"
+HEALTHCHECK_TIMEOUT=10
+HEALTHCHECK_EXPECT_REGEX=""
+
+# Command mode example:
+# HEALTHCHECK_MODE="command"
+# HEALTHCHECK_COMMAND="curl -fsS http://127.0.0.1:3000/health >/dev/null"
+HEALTHCHECK_COMMAND="curl -fsS http://127.0.0.1:3000/health >/dev/null"
+
+# If RESTART_COMMAND is empty, START_COMMAND is used as the recovery command.
+START_COMMAND="nohup codex app-server >>\"\$HOME/.termux-codex-keeper/app-server.log\" 2>&1 &"
+RESTART_COMMAND="pkill -f 'codex app-server' >/dev/null 2>&1 || true; nohup codex app-server >>\"\$HOME/.termux-codex-keeper/app-server.log\" 2>&1 &"
+
+CHECK_INTERVAL=30
+FAILURE_THRESHOLD=1
+COOLDOWN_SECONDS=20
+POST_RESTART_WAIT_SECONDS=5
+
+NOTIFY_ENABLED=1
+NOTIFY_FAILURE=1
+NOTIFY_SUCCESS=1
+
+STATE_DIR="$HOME/.termux-codex-keeper"
+PID_FILE="$STATE_DIR/keeper.pid"
+STATE_FILE="$STATE_DIR/state.env"
+LOG_FILE="$STATE_DIR/keeper.log"
+LOCK_DIR="$STATE_DIR/ensure.lock"
+LOG_TO_STDERR=1

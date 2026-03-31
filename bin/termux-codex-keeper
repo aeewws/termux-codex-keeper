@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+PROGRAM_NAME="$(basename "$0")"
+DEFAULT_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/termux-codex-keeper/config.conf"
+CONFIG_FILE="${TERMUX_CODEX_KEEPER_CONFIG:-}"
+CONFIG_FOUND=0
+
+APP_NAME="Codex app-server"
+HEALTHCHECK_MODE="url"
+HEALTHCHECK_URL="http://127.0.0.1:3000/health"
+HEALTHCHECK_METHOD="GET"
+HEALTHCHECK_TIMEOUT=10
+HEALTHCHECK_EXPECT_REGEX=""
+HEALTHCHECK_COMMAND="printf 'healthy\n'"
+START_COMMAND=""
+RESTART_COMMAND=""
+CHECK_INTERVAL=30
+FAILURE_THRESHOLD=1
+COOLDOWN_SECONDS=20
+POST_RESTART_WAIT_SECONDS=5
+NOTIFY_ENABLED=1
+NOTIFY_FAILURE=1
+NOTIFY_SUCCESS=1
+STATE_DIR="$HOME/.termux-codex-keeper"
+PID_FILE=""
+STATE_FILE=""
+LOG_FILE=""
+LOCK_DIR=""
+LOG_TO_STDERR=1
+
+LAST_CHECK_AT=""
+LAST_CHECK_STATUS="unknown"
+LAST_CHECK_DETAIL="No checks yet."
+LAST_RESTART_AT=""
+LAST_RESTART_STATUS="never"
+LAST_RESTART_DETAIL="No restarts yet."
+CONSECUTIVE_FAILURES=0
+LAST_NOTIFY_AT=""
+LAST_NOTIFY_STATUS="never"
+LAST_NOTIFY_DETAIL="No notifications yet."
+LAST_ACTION="idle"
+
+show_help() {
+  cat <<'EOF'
+Usage:
+  termux-codex-keeper <command>
+
+Commands:
+  doctor         Validate dependencies, config, and runtime assumptions
+  status         Show current keeper status and the last known health state
+  check          Run one health check without restarting anything
+  ensure         Run one health check and restart if the target is unhealthy
+  start          Run the keeper loop in the foreground
+  restart        Run the configured restart command immediately
+  notify [msg]   Send a manual notification or log a fallback message
+  print-config   Print the resolved runtime configuration
+  help           Show this help text
+  version        Show the current version
+
+Environment:
+  TERMUX_CODEX_KEEPER_CONFIG   Override the config file path
+  KEEPER_MAX_LOOPS             Limit `start` to N iterations (useful for tests)
+EOF
+}
+
+log() {
+  local message="${1:-}"
+  local timestamp
+  timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  if [ -n "${LOG_FILE:-}" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    printf '[%s] %s\n' "$timestamp" "$message" >>"$LOG_FILE"
+  fi
+  if [ "${LOG_TO_STDERR}" = "1" ]; then
+    printf '[%s] %s\n' "$timestamp" "$message" >&2
+  fi
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+trim_output() {
+  tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-180
+}
+
+is_integer() {
+  case "${1:-}" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+load_config() {
+  local candidate
+
+  if [ -z "$CONFIG_FILE" ]; then
+    for candidate in \
+      "${XDG_CONFIG_HOME:-$HOME/.config}/termux-codex-keeper/config.conf" \
+      "$HOME/.config/termux-codex-keeper/config.conf" \
+      "$HOME/.termux-codex-keeper/config.conf"
+    do
+      if [ -f "$candidate" ]; then
+        CONFIG_FILE="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$CONFIG_FILE" ]; then
+    CONFIG_FILE="$DEFAULT_CONFIG_PATH"
+  fi
+
+  if [ -f "$CONFIG_FILE" ]; then
+    CONFIG_FOUND=1
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+
+  if [ -z "${PID_FILE:-}" ]; then
+    PID_FILE="$STATE_DIR/keeper.pid"
+  fi
+  if [ -z "${STATE_FILE:-}" ]; then
+    STATE_FILE="$STATE_DIR/state.env"
+  fi
+  if [ -z "${LOG_FILE:-}" ]; then
+    LOG_FILE="$STATE_DIR/keeper.log"
+  fi
+  if [ -z "${LOCK_DIR:-}" ]; then
+    LOCK_DIR="$STATE_DIR/ensure.lock"
+  fi
+}
+
+ensure_runtime_dirs() {
+  mkdir -p "$STATE_DIR"
+}
+
+load_state() {
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+  fi
+}
+
+write_state_var() {
+  local key="$1"
+  local value="$2"
+  printf '%s=%q\n' "$key" "$value"
+}
+
+save_state() {
+  ensure_runtime_dirs
+  {
+    write_state_var "LAST_CHECK_AT" "$LAST_CHECK_AT"
+    write_state_var "LAST_CHECK_STATUS" "$LAST_CHECK_STATUS"
+    write_state_var "LAST_CHECK_DETAIL" "$LAST_CHECK_DETAIL"
+    write_state_var "LAST_RESTART_AT" "$LAST_RESTART_AT"
+    write_state_var "LAST_RESTART_STATUS" "$LAST_RESTART_STATUS"
+    write_state_var "LAST_RESTART_DETAIL" "$LAST_RESTART_DETAIL"
+    write_state_var "CONSECUTIVE_FAILURES" "$CONSECUTIVE_FAILURES"
+    write_state_var "LAST_NOTIFY_AT" "$LAST_NOTIFY_AT"
+    write_state_var "LAST_NOTIFY_STATUS" "$LAST_NOTIFY_STATUS"
+    write_state_var "LAST_NOTIFY_DETAIL" "$LAST_NOTIFY_DETAIL"
+    write_state_var "LAST_ACTION" "$LAST_ACTION"
+  } >"$STATE_FILE"
+}
+
+runtime_timestamp() {
+  date '+%Y-%m-%d %H:%M:%S %z'
+}
+
+acquire_lock() {
+  ensure_runtime_dirs
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    return 0
+  fi
+  log "Another ensure/check is already in progress."
+  return 1
+}
+
+release_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+pid_is_alive() {
+  local pid="${1:-}"
+  [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+read_pid() {
+  if [ -f "$PID_FILE" ]; then
+    tr -d '[:space:]' <"$PID_FILE"
+  fi
+}
+
+cleanup_pid_file() {
+  local pid_in_file
+  pid_in_file="$(read_pid)"
+  if [ "${pid_in_file:-}" = "$$" ]; then
+    rm -f "$PID_FILE"
+  fi
+}
+
+notification_available() {
+  command_exists "termux-notification"
+}
+
+send_notification() {
+  local title="$1"
+  local body="$2"
+
+  LAST_NOTIFY_AT="$(runtime_timestamp)"
+
+  if [ "${NOTIFY_ENABLED}" != "1" ]; then
+    LAST_NOTIFY_STATUS="disabled"
+    LAST_NOTIFY_DETAIL="Notifications are disabled."
+    save_state
+    return 0
+  fi
+
+  if notification_available; then
+    if termux-notification --title "$title" --content "$body" >/dev/null 2>&1; then
+      LAST_NOTIFY_STATUS="sent"
+      LAST_NOTIFY_DETAIL="$title: $body"
+      save_state
+      return 0
+    fi
+    LAST_NOTIFY_STATUS="failed"
+    LAST_NOTIFY_DETAIL="termux-notification returned a non-zero exit code."
+    save_state
+    return 1
+  fi
+
+  LAST_NOTIFY_STATUS="skipped"
+  LAST_NOTIFY_DETAIL="termux-notification is unavailable; logged fallback message."
+  save_state
+  log "Notification fallback: $title - $body"
+  return 0
+}
+
+run_bash_command() {
+  local command_string="$1"
+  local output_file
+  local exit_code
+  output_file="$(mktemp)"
+  if bash -lc "$command_string" >"$output_file" 2>&1; then
+    trim_output <"$output_file"
+    rm -f "$output_file"
+    return 0
+  else
+    exit_code=$?
+    printf 'exit=%s output=%s' "$exit_code" "$(trim_output <"$output_file")"
+    rm -f "$output_file"
+    return "$exit_code"
+  fi
+}
+
+run_url_healthcheck() {
+  local body_file
+  local error_file
+  local http_code
+  local response_snippet
+
+  body_file="$(mktemp)"
+  error_file="$(mktemp)"
+
+  if http_code="$(curl \
+    --silent \
+    --show-error \
+    --location \
+    --output "$body_file" \
+    --write-out '%{http_code}' \
+    --max-time "$HEALTHCHECK_TIMEOUT" \
+    --request "$HEALTHCHECK_METHOD" \
+    "$HEALTHCHECK_URL" 2>"$error_file")"
+  then
+    :
+  else
+    local curl_code=$?
+    HEALTHCHECK_DETAIL="curl failed (exit ${curl_code}): $(trim_output <"$error_file")"
+    rm -f "$body_file" "$error_file"
+    return 1
+  fi
+
+  if ! printf '%s' "$http_code" | grep -Eq '^2[0-9][0-9]$'; then
+    response_snippet="$(trim_output <"$body_file")"
+    HEALTHCHECK_DETAIL="Expected HTTP 2xx, got ${http_code}. Body: ${response_snippet:-<empty>}"
+    rm -f "$body_file" "$error_file"
+    return 1
+  fi
+
+  if [ -n "$HEALTHCHECK_EXPECT_REGEX" ] && ! grep -Eq -- "$HEALTHCHECK_EXPECT_REGEX" "$body_file"; then
+    response_snippet="$(trim_output <"$body_file")"
+    HEALTHCHECK_DETAIL="Body did not match HEALTHCHECK_EXPECT_REGEX. Body: ${response_snippet:-<empty>}"
+    rm -f "$body_file" "$error_file"
+    return 1
+  fi
+
+  response_snippet="$(trim_output <"$body_file")"
+  HEALTHCHECK_DETAIL="HTTP ${http_code}. Body: ${response_snippet:-<empty>}"
+  rm -f "$body_file" "$error_file"
+  return 0
+}
+
+run_command_healthcheck() {
+  local output
+  local exit_code
+  if output="$(run_bash_command "$HEALTHCHECK_COMMAND")"; then
+    HEALTHCHECK_DETAIL="Command succeeded. ${output:-No output.}"
+    return 0
+  else
+    exit_code=$?
+    HEALTHCHECK_DETAIL="Command failed. ${output:-No output.}"
+    return "$exit_code"
+  fi
+}
+
+healthcheck() {
+  HEALTHCHECK_DETAIL=""
+  case "$HEALTHCHECK_MODE" in
+    url)
+      if ! command_exists "curl"; then
+        HEALTHCHECK_DETAIL="curl is required for HEALTHCHECK_MODE=url."
+        return 1
+      fi
+      run_url_healthcheck
+      ;;
+    command)
+      run_command_healthcheck
+      ;;
+    *)
+      HEALTHCHECK_DETAIL="Unsupported HEALTHCHECK_MODE: $HEALTHCHECK_MODE"
+      return 1
+      ;;
+  esac
+}
+
+restart_command_string() {
+  if [ -n "$RESTART_COMMAND" ]; then
+    printf '%s' "$RESTART_COMMAND"
+    return 0
+  fi
+  if [ -n "$START_COMMAND" ]; then
+    printf '%s' "$START_COMMAND"
+    return 0
+  fi
+  return 1
+}
+
+perform_restart() {
+  local command_string
+  local output
+  local exit_code
+
+  if ! command_string="$(restart_command_string)"; then
+    LAST_RESTART_DETAIL="RESTART_COMMAND is empty and START_COMMAND is unavailable."
+    LAST_RESTART_STATUS="failed"
+    return 1
+  fi
+
+  LAST_RESTART_AT="$(runtime_timestamp)"
+
+  if output="$(run_bash_command "$command_string")"; then
+    LAST_RESTART_STATUS="command-succeeded"
+    LAST_RESTART_DETAIL="${output:-Restart command completed without output.}"
+    return 0
+  else
+    exit_code=$?
+    LAST_RESTART_STATUS="failed"
+    LAST_RESTART_DETAIL="${output:-Restart command failed without output.}"
+    return "$exit_code"
+  fi
+}
+
+validate_runtime() {
+  local ok=0
+
+  if ! is_integer "$HEALTHCHECK_TIMEOUT"; then
+    log "HEALTHCHECK_TIMEOUT must be an integer."
+    ok=1
+  fi
+  if ! is_integer "$CHECK_INTERVAL"; then
+    log "CHECK_INTERVAL must be an integer."
+    ok=1
+  fi
+  if ! is_integer "$FAILURE_THRESHOLD"; then
+    log "FAILURE_THRESHOLD must be an integer."
+    ok=1
+  fi
+  if ! is_integer "$COOLDOWN_SECONDS"; then
+    log "COOLDOWN_SECONDS must be an integer."
+    ok=1
+  fi
+  if ! is_integer "$POST_RESTART_WAIT_SECONDS"; then
+    log "POST_RESTART_WAIT_SECONDS must be an integer."
+    ok=1
+  fi
+  if [ "$ok" -ne 0 ]; then
+    return 1
+  fi
+}
+
+run_check() {
+  load_state
+  if ! acquire_lock; then
+    return 1
+  fi
+
+  LAST_ACTION="check"
+  LAST_CHECK_AT="$(runtime_timestamp)"
+
+  if healthcheck; then
+    if [ "$CONSECUTIVE_FAILURES" -gt 0 ] && [ "${NOTIFY_SUCCESS}" = "1" ]; then
+      send_notification "$APP_NAME healthy" "$HEALTHCHECK_DETAIL" || true
+    fi
+    CONSECUTIVE_FAILURES=0
+    LAST_CHECK_STATUS="healthy"
+    save_state
+    log "Health check passed: $HEALTHCHECK_DETAIL"
+    release_lock
+    return 0
+  fi
+
+  CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+  LAST_CHECK_STATUS="unhealthy"
+  save_state
+  log "Health check failed: $HEALTHCHECK_DETAIL"
+  release_lock
+  return 1
+}
+
+run_ensure() {
+  local cooldown_marker
+
+  if run_check; then
+    return 0
+  fi
+
+  if [ "$CONSECUTIVE_FAILURES" -lt "$FAILURE_THRESHOLD" ]; then
+    log "Failure threshold not reached yet (${CONSECUTIVE_FAILURES}/${FAILURE_THRESHOLD})."
+    return 1
+  fi
+
+  if [ -n "$LAST_RESTART_AT" ] && [ "$COOLDOWN_SECONDS" -gt 0 ]; then
+    cooldown_marker="$(date -d "$LAST_RESTART_AT" '+%s' 2>/dev/null || true)"
+    if [ -n "$cooldown_marker" ]; then
+      local now_epoch
+      now_epoch="$(date '+%s')"
+      if [ $((now_epoch - cooldown_marker)) -lt "$COOLDOWN_SECONDS" ]; then
+        log "Restart skipped because cooldown is still active."
+        return 1
+      fi
+    fi
+  fi
+
+  LAST_ACTION="ensure"
+  if ! perform_restart; then
+    save_state
+    if [ "${NOTIFY_FAILURE}" = "1" ]; then
+      send_notification "$APP_NAME restart failed" "$LAST_RESTART_DETAIL" || true
+    fi
+    log "Restart failed: $LAST_RESTART_DETAIL"
+    return 1
+  fi
+
+  save_state
+  log "Restart command succeeded: $LAST_RESTART_DETAIL"
+
+  if [ "$POST_RESTART_WAIT_SECONDS" -gt 0 ]; then
+    sleep "$POST_RESTART_WAIT_SECONDS"
+  fi
+
+  LAST_CHECK_AT="$(runtime_timestamp)"
+  if healthcheck; then
+    CONSECUTIVE_FAILURES=0
+    LAST_CHECK_STATUS="healthy"
+    LAST_RESTART_STATUS="recovered"
+    LAST_RESTART_DETAIL="Restarted successfully. $HEALTHCHECK_DETAIL"
+    save_state
+    if [ "${NOTIFY_SUCCESS}" = "1" ]; then
+      send_notification "$APP_NAME recovered" "$LAST_RESTART_DETAIL" || true
+    fi
+    log "Service recovered after restart."
+    return 0
+  fi
+
+  LAST_CHECK_STATUS="unhealthy"
+  LAST_RESTART_STATUS="unhealthy-after-restart"
+  LAST_RESTART_DETAIL="Restart command ran, but the target is still unhealthy. $HEALTHCHECK_DETAIL"
+  save_state
+  if [ "${NOTIFY_FAILURE}" = "1" ]; then
+    send_notification "$APP_NAME still unhealthy" "$LAST_RESTART_DETAIL" || true
+  fi
+  log "Service still unhealthy after restart."
+  return 1
+}
+
+run_doctor() {
+  local failed=0
+
+  printf 'Program: %s %s\n' "$PROGRAM_NAME" "$VERSION"
+  printf 'Config file: %s\n' "$CONFIG_FILE"
+  printf 'Config present: %s\n' "$CONFIG_FOUND"
+  printf 'Notification command: %s\n' "$(notification_available && printf 'termux-notification found' || printf 'termux-notification missing (fallback logging will be used)')"
+
+  if [ "$CONFIG_FOUND" -ne 1 ]; then
+    printf 'WARN: Config file not found. Create it from config/termux-codex-keeper.conf.example.\n'
+    failed=1
+  fi
+
+  if [ "$HEALTHCHECK_MODE" = "url" ] && ! command_exists "curl"; then
+    printf 'FAIL: curl is required for HEALTHCHECK_MODE=url.\n'
+    failed=1
+  fi
+
+  if [ "$HEALTHCHECK_MODE" = "command" ] && ! command_exists "bash"; then
+    printf 'FAIL: bash is required for HEALTHCHECK_MODE=command.\n'
+    failed=1
+  fi
+
+  if ! validate_runtime; then
+    printf 'FAIL: One or more integer settings are invalid.\n'
+    failed=1
+  fi
+
+  if [ -z "$RESTART_COMMAND" ] && [ -z "$START_COMMAND" ]; then
+    printf 'WARN: No restart command configured; ensure cannot recover the service.\n'
+    failed=1
+  fi
+
+  printf 'Healthcheck mode: %s\n' "$HEALTHCHECK_MODE"
+  printf 'State dir: %s\n' "$STATE_DIR"
+  printf 'PID file: %s\n' "$PID_FILE"
+  printf 'State file: %s\n' "$STATE_FILE"
+  printf 'Log file: %s\n' "$LOG_FILE"
+
+  if [ "$failed" -ne 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+run_status() {
+  local current_pid
+  local keeper_state
+
+  load_state
+  current_pid="$(read_pid)"
+  if pid_is_alive "${current_pid:-}"; then
+    keeper_state="running (pid ${current_pid})"
+  elif [ -n "${current_pid:-}" ]; then
+    keeper_state="stale pid file (${current_pid})"
+  else
+    keeper_state="not running"
+  fi
+
+  cat <<EOF
+App name:            $APP_NAME
+Config file:         $CONFIG_FILE
+Keeper process:      $keeper_state
+Healthcheck mode:    $HEALTHCHECK_MODE
+Last check at:       $LAST_CHECK_AT
+Last check status:   $LAST_CHECK_STATUS
+Last check detail:   $LAST_CHECK_DETAIL
+Last restart at:     $LAST_RESTART_AT
+Last restart status: $LAST_RESTART_STATUS
+Last restart detail: $LAST_RESTART_DETAIL
+Failures in a row:   $CONSECUTIVE_FAILURES
+Last notify at:      $LAST_NOTIFY_AT
+Last notify status:  $LAST_NOTIFY_STATUS
+Last notify detail:  $LAST_NOTIFY_DETAIL
+Notification ready:  $(notification_available && printf 'yes' || printf 'no')
+EOF
+}
+
+run_print_config() {
+  cat <<EOF
+APP_NAME=$APP_NAME
+CONFIG_FILE=$CONFIG_FILE
+HEALTHCHECK_MODE=$HEALTHCHECK_MODE
+HEALTHCHECK_URL=$HEALTHCHECK_URL
+HEALTHCHECK_METHOD=$HEALTHCHECK_METHOD
+HEALTHCHECK_TIMEOUT=$HEALTHCHECK_TIMEOUT
+HEALTHCHECK_EXPECT_REGEX=$HEALTHCHECK_EXPECT_REGEX
+HEALTHCHECK_COMMAND=$HEALTHCHECK_COMMAND
+START_COMMAND=$START_COMMAND
+RESTART_COMMAND=$RESTART_COMMAND
+CHECK_INTERVAL=$CHECK_INTERVAL
+FAILURE_THRESHOLD=$FAILURE_THRESHOLD
+COOLDOWN_SECONDS=$COOLDOWN_SECONDS
+POST_RESTART_WAIT_SECONDS=$POST_RESTART_WAIT_SECONDS
+NOTIFY_ENABLED=$NOTIFY_ENABLED
+NOTIFY_FAILURE=$NOTIFY_FAILURE
+NOTIFY_SUCCESS=$NOTIFY_SUCCESS
+STATE_DIR=$STATE_DIR
+PID_FILE=$PID_FILE
+STATE_FILE=$STATE_FILE
+LOG_FILE=$LOG_FILE
+LOCK_DIR=$LOCK_DIR
+EOF
+}
+
+run_start_loop() {
+  local active_pid
+  local max_loops
+  local loop_count=0
+  local last_exit_code=0
+
+  active_pid="$(read_pid)"
+  if pid_is_alive "${active_pid:-}"; then
+    log "Keeper is already running with pid ${active_pid}."
+    return 1
+  fi
+
+  ensure_runtime_dirs
+  printf '%s\n' "$$" >"$PID_FILE"
+  trap 'cleanup_pid_file' EXIT INT TERM
+
+  max_loops="${KEEPER_MAX_LOOPS:-0}"
+  if ! is_integer "$max_loops"; then
+    log "KEEPER_MAX_LOOPS must be an integer."
+    return 1
+  fi
+
+  log "Keeper loop started."
+  while true; do
+    if run_ensure; then
+      last_exit_code=0
+    else
+      last_exit_code=$?
+    fi
+    loop_count=$((loop_count + 1))
+    if [ "$max_loops" -gt 0 ] && [ "$loop_count" -ge "$max_loops" ]; then
+      break
+    fi
+    sleep "$CHECK_INTERVAL"
+  done
+
+  log "Keeper loop stopped after ${loop_count} iteration(s)."
+  return "$last_exit_code"
+}
+
+run_manual_notification() {
+  local message="${1:-Manual notification from termux-codex-keeper}"
+  send_notification "$APP_NAME notification" "$message"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    help|-h|--help)
+      show_help
+      return 0
+      ;;
+    version|--version)
+      printf '%s\n' "$VERSION"
+      return 0
+      ;;
+  esac
+
+  load_config
+  ensure_runtime_dirs
+  load_state
+  validate_runtime
+
+  case "$command" in
+    doctor)
+      run_doctor
+      ;;
+    status)
+      run_status
+      ;;
+    check)
+      run_check
+      ;;
+    ensure)
+      run_ensure
+      ;;
+    start)
+      run_start_loop
+      ;;
+    restart)
+      perform_restart
+      save_state
+      ;;
+    notify)
+      run_manual_notification "${*:-}"
+      ;;
+    print-config)
+      run_print_config
+      ;;
+    *)
+      show_help >&2
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
