@@ -53,4 +53,43 @@ test -f "$RESTART_MARKER"
 
 bash "$BIN" notify "smoke notification fallback" >/dev/null
 
+BROKEN_CONFIG="$TMP_DIR/broken.conf"
+cat >"$BROKEN_CONFIG" <<EOF
+APP_NAME="Broken Config"
+HEALTHCHECK_MODE="command"
+HEALTHCHECK_COMMAND="printf 'healthy\n'"
+CHECK_INTERVAL="abc"
+STATE_DIR="$STATE_DIR"
+LOG_TO_STDERR=0
+EOF
+TERMUX_CODEX_KEEPER_CONFIG="$BROKEN_CONFIG" bash "$BIN" doctor >"$TMP_DIR/doctor-broken.out" 2>&1 || true
+grep -q "FAIL: One or more integer settings are invalid." "$TMP_DIR/doctor-broken.out"
+grep -q "Config file: $BROKEN_CONFIG" "$TMP_DIR/doctor-broken.out"
+
+SYNTAX_CONFIG="$TMP_DIR/syntax.conf"
+cat >"$SYNTAX_CONFIG" <<'EOF'
+APP_NAME="unterminated
+EOF
+TERMUX_CODEX_KEEPER_CONFIG="$SYNTAX_CONFIG" bash "$BIN" doctor >"$TMP_DIR/doctor-syntax.out" 2>&1 || true
+grep -q "Failed to parse config file" "$TMP_DIR/doctor-syntax.out"
+
+BROKEN_STATE_DIR="$TMP_DIR/broken-state"
+mkdir -p "$BROKEN_STATE_DIR"
+BROKEN_STATE_CONFIG="$TMP_DIR/broken-state.conf"
+cat >"$BROKEN_STATE_CONFIG" <<EOF
+APP_NAME="Broken State"
+HEALTHCHECK_MODE="command"
+HEALTHCHECK_COMMAND="printf 'healthy\n'"
+CHECK_INTERVAL=1
+FAILURE_THRESHOLD=1
+COOLDOWN_SECONDS=0
+POST_RESTART_WAIT_SECONDS=0
+NOTIFY_ENABLED=0
+STATE_DIR="$BROKEN_STATE_DIR"
+LOG_TO_STDERR=0
+EOF
+printf 'LAST_CHECK_STATUS="broken\n' >"$BROKEN_STATE_DIR/state.env"
+TERMUX_CODEX_KEEPER_CONFIG="$BROKEN_STATE_CONFIG" bash "$BIN" status >"$TMP_DIR/status-broken-state.out" 2>&1
+grep -q "State load error:" "$TMP_DIR/status-broken-state.out"
+
 printf 'smoke check passed\n'

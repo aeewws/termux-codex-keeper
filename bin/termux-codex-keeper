@@ -6,6 +6,8 @@ PROGRAM_NAME="$(basename "$0")"
 DEFAULT_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/termux-codex-keeper/config.conf"
 CONFIG_FILE="${TERMUX_CODEX_KEEPER_CONFIG:-}"
 CONFIG_FOUND=0
+CONFIG_LOAD_ERROR=""
+STATE_LOAD_ERROR=""
 
 APP_NAME="Codex app-server"
 HEALTHCHECK_MODE="url"
@@ -119,8 +121,9 @@ load_config() {
 
   if [ -f "$CONFIG_FILE" ]; then
     CONFIG_FOUND=1
-    # shellcheck disable=SC1090
-    . "$CONFIG_FILE"
+    if ! source_shell_file "$CONFIG_FILE" CONFIG_LOAD_ERROR; then
+      CONFIG_LOAD_ERROR="Failed to parse config file: $CONFIG_FILE${CONFIG_LOAD_ERROR:+ ($CONFIG_LOAD_ERROR)}"
+    fi
   fi
 
   if [ -z "${PID_FILE:-}" ]; then
@@ -143,9 +146,24 @@ ensure_runtime_dirs() {
 
 load_state() {
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$STATE_FILE"
+    if ! source_shell_file "$STATE_FILE" STATE_LOAD_ERROR; then
+      STATE_LOAD_ERROR="Failed to parse state file: $STATE_FILE${STATE_LOAD_ERROR:+ ($STATE_LOAD_ERROR)}"
+    fi
   fi
+}
+
+source_shell_file() {
+  local path="$1"
+  local error_var="$2"
+  local syntax_output=""
+
+  if ! syntax_output="$(bash -n "$path" 2>&1)"; then
+    printf -v "$error_var" '%s' "${syntax_output:-syntax error}"
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  . "$path"
 }
 
 write_state_var() {
@@ -512,6 +530,14 @@ run_doctor() {
   printf 'Program: %s %s\n' "$PROGRAM_NAME" "$VERSION"
   printf 'Config file: %s\n' "$CONFIG_FILE"
   printf 'Config present: %s\n' "$CONFIG_FOUND"
+  if [ -n "$CONFIG_LOAD_ERROR" ]; then
+    printf 'FAIL: %s\n' "$CONFIG_LOAD_ERROR"
+    failed=1
+  fi
+  if [ -n "$STATE_LOAD_ERROR" ]; then
+    printf 'FAIL: %s\n' "$STATE_LOAD_ERROR"
+    failed=1
+  fi
   printf 'Notification command: %s\n' "$(notification_available && printf 'termux-notification found' || printf 'termux-notification missing (fallback logging will be used)')"
 
   if [ "$CONFIG_FOUND" -ne 1 ]; then
@@ -554,8 +580,6 @@ run_doctor() {
 run_status() {
   local current_pid
   local keeper_state
-
-  load_state
   current_pid="$(read_pid)"
   if pid_is_alive "${current_pid:-}"; then
     keeper_state="running (pid ${current_pid})"
@@ -582,6 +606,12 @@ Last notify status:  $LAST_NOTIFY_STATUS
 Last notify detail:  $LAST_NOTIFY_DETAIL
 Notification ready:  $(notification_available && printf 'yes' || printf 'no')
 EOF
+  if [ -n "$CONFIG_LOAD_ERROR" ]; then
+    printf 'Config load error:   %s\n' "$CONFIG_LOAD_ERROR"
+  fi
+  if [ -n "$STATE_LOAD_ERROR" ]; then
+    printf 'State load error:    %s\n' "$STATE_LOAD_ERROR"
+  fi
 }
 
 run_print_config() {
@@ -609,6 +639,12 @@ STATE_FILE=$STATE_FILE
 LOG_FILE=$LOG_FILE
 LOCK_DIR=$LOCK_DIR
 EOF
+  if [ -n "$CONFIG_LOAD_ERROR" ]; then
+    printf 'CONFIG_LOAD_ERROR=%s\n' "$CONFIG_LOAD_ERROR"
+  fi
+  if [ -n "$STATE_LOAD_ERROR" ]; then
+    printf 'STATE_LOAD_ERROR=%s\n' "$STATE_LOAD_ERROR"
+  fi
 }
 
 run_start_loop() {
@@ -671,10 +707,25 @@ main() {
       ;;
   esac
 
-  load_config
+  load_config || true
   ensure_runtime_dirs
-  load_state
-  validate_runtime
+  load_state || true
+
+  case "$command" in
+    doctor|status|print-config)
+      ;;
+    *)
+      if [ -n "$CONFIG_LOAD_ERROR" ]; then
+        log "$CONFIG_LOAD_ERROR"
+        return 1
+      fi
+      if [ -n "$STATE_LOAD_ERROR" ]; then
+        log "$STATE_LOAD_ERROR"
+        return 1
+      fi
+      validate_runtime
+      ;;
+  esac
 
   case "$command" in
     doctor)
