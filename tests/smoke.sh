@@ -92,4 +92,20 @@ printf 'LAST_CHECK_STATUS="broken\n' >"$BROKEN_STATE_DIR/state.env"
 TERMUX_CODEX_KEEPER_CONFIG="$BROKEN_STATE_CONFIG" bash "$BIN" status >"$TMP_DIR/status-broken-state.out" 2>&1
 grep -q "State load error:" "$TMP_DIR/status-broken-state.out"
 
+INSTALL_ROOT="$TMP_DIR/install"
+BIN_INSTALL="$INSTALL_ROOT/bin"
+CONFIG_INSTALL="$INSTALL_ROOT/config"
+BOOT_INSTALL="$INSTALL_ROOT/boot"
+bash "$ROOT_DIR/install.sh" \
+  --bin-dir "$BIN_INSTALL" \
+  --config-dir "$CONFIG_INSTALL" \
+  --boot-dir "$BOOT_INSTALL" \
+  --with-boot \
+  --force >/dev/null
+test -x "$BIN_INSTALL/termux-codex-keeper"
+test -f "$CONFIG_INSTALL/config.conf"
+test -f "$BOOT_INSTALL/termux-codex-keeper"
+grep -q "TERMUX_CODEX_KEEPER_CONFIG=\"$CONFIG_INSTALL/config.conf\"" "$BOOT_INSTALL/termux-codex-keeper"
+bash "$BIN_INSTALL/termux-codex-keeper" help >/dev/null
+
 printf 'smoke check passed\n'
