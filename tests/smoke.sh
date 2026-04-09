@@ -53,6 +53,31 @@ test -f "$RESTART_MARKER"
 
 bash "$BIN" notify "smoke notification fallback" >/dev/null
 
+COOLDOWN_DIR="$TMP_DIR/cooldown"
+COOLDOWN_MARKER="$COOLDOWN_DIR/restarted.log"
+mkdir -p "$COOLDOWN_DIR"
+COOLDOWN_CONFIG="$TMP_DIR/cooldown.conf"
+cat >"$COOLDOWN_CONFIG" <<EOF
+APP_NAME="Cooldown Test"
+HEALTHCHECK_MODE="command"
+HEALTHCHECK_COMMAND="false"
+RESTART_COMMAND="echo restart >> '$COOLDOWN_MARKER'"
+CHECK_INTERVAL=1
+FAILURE_THRESHOLD=1
+COOLDOWN_SECONDS=60
+POST_RESTART_WAIT_SECONDS=0
+NOTIFY_ENABLED=0
+STATE_DIR="$COOLDOWN_DIR/state"
+LOG_TO_STDERR=0
+EOF
+TERMUX_CODEX_KEEPER_CONFIG="$COOLDOWN_CONFIG" bash "$BIN" ensure >/dev/null 2>&1 || true
+test -f "$COOLDOWN_MARKER"
+grep -q '^LAST_RESTART_EPOCH=' "$COOLDOWN_DIR/state/state.env"
+restart_count_before="$(wc -l < "$COOLDOWN_MARKER")"
+TERMUX_CODEX_KEEPER_CONFIG="$COOLDOWN_CONFIG" bash "$BIN" ensure >/dev/null 2>&1 || true
+restart_count_after="$(wc -l < "$COOLDOWN_MARKER")"
+[ "$restart_count_before" = "$restart_count_after" ]
+
 BROKEN_CONFIG="$TMP_DIR/broken.conf"
 cat >"$BROKEN_CONFIG" <<EOF
 APP_NAME="Broken Config"

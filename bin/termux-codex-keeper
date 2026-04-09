@@ -36,6 +36,7 @@ LAST_CHECK_AT=""
 LAST_CHECK_STATUS="unknown"
 LAST_CHECK_DETAIL="No checks yet."
 LAST_RESTART_AT=""
+LAST_RESTART_EPOCH=""
 LAST_RESTART_STATUS="never"
 LAST_RESTART_DETAIL="No restarts yet."
 CONSECUTIVE_FAILURES=0
@@ -179,6 +180,7 @@ save_state() {
     write_state_var "LAST_CHECK_STATUS" "$LAST_CHECK_STATUS"
     write_state_var "LAST_CHECK_DETAIL" "$LAST_CHECK_DETAIL"
     write_state_var "LAST_RESTART_AT" "$LAST_RESTART_AT"
+    write_state_var "LAST_RESTART_EPOCH" "$LAST_RESTART_EPOCH"
     write_state_var "LAST_RESTART_STATUS" "$LAST_RESTART_STATUS"
     write_state_var "LAST_RESTART_DETAIL" "$LAST_RESTART_DETAIL"
     write_state_var "CONSECUTIVE_FAILURES" "$CONSECUTIVE_FAILURES"
@@ -383,6 +385,7 @@ perform_restart() {
   fi
 
   LAST_RESTART_AT="$(runtime_timestamp)"
+  LAST_RESTART_EPOCH="$(date '+%s')"
 
   if output="$(run_bash_command "$command_string")"; then
     LAST_RESTART_STATUS="command-succeeded"
@@ -470,8 +473,14 @@ run_ensure() {
     return 1
   fi
 
-  if [ -n "$LAST_RESTART_AT" ] && [ "$COOLDOWN_SECONDS" -gt 0 ]; then
-    cooldown_marker="$(date -d "$LAST_RESTART_AT" '+%s' 2>/dev/null || true)"
+  if [ "$COOLDOWN_SECONDS" -gt 0 ]; then
+    cooldown_marker="${LAST_RESTART_EPOCH:-}"
+    if ! is_integer "$cooldown_marker"; then
+      cooldown_marker=""
+    fi
+    if [ -z "$cooldown_marker" ] && [ -n "$LAST_RESTART_AT" ] && command_exists "date"; then
+      cooldown_marker="$(date -d "$LAST_RESTART_AT" '+%s' 2>/dev/null || true)"
+    fi
     if [ -n "$cooldown_marker" ]; then
       local now_epoch
       now_epoch="$(date '+%s')"
@@ -598,6 +607,7 @@ Last check at:       $LAST_CHECK_AT
 Last check status:   $LAST_CHECK_STATUS
 Last check detail:   $LAST_CHECK_DETAIL
 Last restart at:     $LAST_RESTART_AT
+Last restart epoch:  $LAST_RESTART_EPOCH
 Last restart status: $LAST_RESTART_STATUS
 Last restart detail: $LAST_RESTART_DETAIL
 Failures in a row:   $CONSECUTIVE_FAILURES
@@ -638,6 +648,7 @@ PID_FILE=$PID_FILE
 STATE_FILE=$STATE_FILE
 LOG_FILE=$LOG_FILE
 LOCK_DIR=$LOCK_DIR
+LAST_RESTART_EPOCH=$LAST_RESTART_EPOCH
 EOF
   if [ -n "$CONFIG_LOAD_ERROR" ]; then
     printf 'CONFIG_LOAD_ERROR=%s\n' "$CONFIG_LOAD_ERROR"
