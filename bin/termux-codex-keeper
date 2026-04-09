@@ -407,6 +407,8 @@ validate_runtime() {
 }
 
 run_check() {
+  local update_error=0
+
   load_state
   if ! acquire_lock; then
     return 1
@@ -421,17 +423,20 @@ run_check() {
     fi
     CONSECUTIVE_FAILURES=0
     LAST_CHECK_STATUS="healthy"
-    save_state
-    log "Health check passed: $HEALTHCHECK_DETAIL"
+    save_state || update_error=1
+    log "Health check passed: $HEALTHCHECK_DETAIL" || update_error=1
     release_lock
-    return 0
+    return "$update_error"
   fi
 
   CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
   LAST_CHECK_STATUS="unhealthy"
-  save_state
-  log "Health check failed: $HEALTHCHECK_DETAIL"
+  save_state || update_error=1
+  log "Health check failed: $HEALTHCHECK_DETAIL" || update_error=1
   release_lock
+  if [ "$update_error" -ne 0 ]; then
+    return "$update_error"
+  fi
   return 1
 }
 
