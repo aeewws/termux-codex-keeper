@@ -53,4 +53,84 @@ test -f "$RESTART_MARKER"
 
 bash "$BIN" notify "smoke notification fallback" >/dev/null
 
+COOLDOWN_DIR="$TMP_DIR/cooldown"
+COOLDOWN_MARKER="$COOLDOWN_DIR/restarted.log"
+mkdir -p "$COOLDOWN_DIR"
+COOLDOWN_CONFIG="$TMP_DIR/cooldown.conf"
+cat >"$COOLDOWN_CONFIG" <<EOF
+APP_NAME="Cooldown Test"
+HEALTHCHECK_MODE="command"
+HEALTHCHECK_COMMAND="false"
+RESTART_COMMAND="echo restart >> '$COOLDOWN_MARKER'"
+CHECK_INTERVAL=1
+FAILURE_THRESHOLD=1
+COOLDOWN_SECONDS=60
+POST_RESTART_WAIT_SECONDS=0
+NOTIFY_ENABLED=0
+STATE_DIR="$COOLDOWN_DIR/state"
+LOG_TO_STDERR=0
+EOF
+TERMUX_CODEX_KEEPER_CONFIG="$COOLDOWN_CONFIG" bash "$BIN" ensure >/dev/null 2>&1 || true
+test -f "$COOLDOWN_MARKER"
+grep -q '^LAST_RESTART_EPOCH=' "$COOLDOWN_DIR/state/state.env"
+restart_count_before="$(wc -l < "$COOLDOWN_MARKER")"
+TERMUX_CODEX_KEEPER_CONFIG="$COOLDOWN_CONFIG" bash "$BIN" ensure >/dev/null 2>&1 || true
+restart_count_after="$(wc -l < "$COOLDOWN_MARKER")"
+[ "$restart_count_before" = "$restart_count_after" ]
+
+BROKEN_CONFIG="$TMP_DIR/broken.conf"
+cat >"$BROKEN_CONFIG" <<EOF
+APP_NAME="Broken Config"
+HEALTHCHECK_MODE="command"
+HEALTHCHECK_COMMAND="printf 'healthy\n'"
+CHECK_INTERVAL="abc"
+STATE_DIR="$STATE_DIR"
+LOG_TO_STDERR=0
+EOF
+TERMUX_CODEX_KEEPER_CONFIG="$BROKEN_CONFIG" bash "$BIN" doctor >"$TMP_DIR/doctor-broken.out" 2>&1 || true
+grep -q "FAIL: One or more integer settings are invalid." "$TMP_DIR/doctor-broken.out"
+grep -q "Config file: $BROKEN_CONFIG" "$TMP_DIR/doctor-broken.out"
+
+SYNTAX_CONFIG="$TMP_DIR/syntax.conf"
+cat >"$SYNTAX_CONFIG" <<'EOF'
+APP_NAME="unterminated
+EOF
+TERMUX_CODEX_KEEPER_CONFIG="$SYNTAX_CONFIG" bash "$BIN" doctor >"$TMP_DIR/doctor-syntax.out" 2>&1 || true
+grep -q "Failed to parse config file" "$TMP_DIR/doctor-syntax.out"
+
+BROKEN_STATE_DIR="$TMP_DIR/broken-state"
+mkdir -p "$BROKEN_STATE_DIR"
+BROKEN_STATE_CONFIG="$TMP_DIR/broken-state.conf"
+cat >"$BROKEN_STATE_CONFIG" <<EOF
+APP_NAME="Broken State"
+HEALTHCHECK_MODE="command"
+HEALTHCHECK_COMMAND="printf 'healthy\n'"
+CHECK_INTERVAL=1
+FAILURE_THRESHOLD=1
+COOLDOWN_SECONDS=0
+POST_RESTART_WAIT_SECONDS=0
+NOTIFY_ENABLED=0
+STATE_DIR="$BROKEN_STATE_DIR"
+LOG_TO_STDERR=0
+EOF
+printf 'LAST_CHECK_STATUS="broken\n' >"$BROKEN_STATE_DIR/state.env"
+TERMUX_CODEX_KEEPER_CONFIG="$BROKEN_STATE_CONFIG" bash "$BIN" status >"$TMP_DIR/status-broken-state.out" 2>&1
+grep -q "State load error:" "$TMP_DIR/status-broken-state.out"
+
+INSTALL_ROOT="$TMP_DIR/install"
+BIN_INSTALL="$INSTALL_ROOT/bin"
+CONFIG_INSTALL="$INSTALL_ROOT/config"
+BOOT_INSTALL="$INSTALL_ROOT/boot"
+bash "$ROOT_DIR/install.sh" \
+  --bin-dir "$BIN_INSTALL" \
+  --config-dir "$CONFIG_INSTALL" \
+  --boot-dir "$BOOT_INSTALL" \
+  --with-boot \
+  --force >/dev/null
+test -x "$BIN_INSTALL/termux-codex-keeper"
+test -f "$CONFIG_INSTALL/config.conf"
+test -f "$BOOT_INSTALL/termux-codex-keeper"
+grep -q "TERMUX_CODEX_KEEPER_CONFIG=\"$CONFIG_INSTALL/config.conf\"" "$BOOT_INSTALL/termux-codex-keeper"
+bash "$BIN_INSTALL/termux-codex-keeper" help >/dev/null
+
 printf 'smoke check passed\n'
