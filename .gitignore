@@ -1,0 +1,8 @@
+# OS / local files
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.log
+tmp/
+temp/
